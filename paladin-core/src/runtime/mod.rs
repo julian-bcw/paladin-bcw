@@ -74,6 +74,8 @@ use crate::{
     task::{AnyTask, AnyTaskOutput, AnyTaskResult, Task, TaskResult},
 };
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 type Receiver<'a, Item> = Box<dyn Stream<Item = (Item, Box<dyn Acker>)> + Send + Unpin + 'a>;
 type Sender<'a, Item> = Box<dyn Publisher<Item> + Send + Unpin + Sync + 'a>;
 type CoordinatedTaskChannel<'a, Op, Metadata> = (
@@ -178,7 +180,7 @@ impl Runtime {
                         task_channel,
                         _marker: Marker,
                     };
-                    worker_runtime.main_loop().await?;
+                    worker_runtime.main_loop(None).await?;
                     Ok(())
                 })
             })
@@ -269,7 +271,7 @@ impl Runtime {
     /// # impl Operation for StringLength {
     /// #    type Input = String;
     /// #    type Output = usize;
-    /// #    
+    /// #
     /// #    fn execute(&self, input: Self::Input) -> Result<Self::Output> {
     /// #       Ok(input.len())
     /// #    }
@@ -486,7 +488,7 @@ impl WorkerRuntime {
     /// # impl Operation for StringLength {
     /// #    type Input = String;
     /// #    type Output = usize;
-    /// #    
+    /// #
     /// #    fn execute(&self, input: Self::Input) -> Result<Self::Output> {
     /// #        Ok(input.len())
     /// #    }
@@ -505,10 +507,10 @@ impl WorkerRuntime {
     /// async fn main() -> anyhow::Result<()> {
     ///     let args = Cli::parse();
     ///     let runtime = WorkerRuntime::from_config(&args.options, register()).await?;
-    ///     
+    ///
     ///     let mut task_stream = runtime.get_task_receiver().await?;
     ///     while let Some((task, delivery)) = task_stream.next().await {
-    ///         // ... handle task   
+    ///         // ... handle task
     ///     }
     /// #  Ok(())
     /// }
@@ -599,7 +601,7 @@ impl WorkerRuntime {
     /// # impl Operation for StringLength {
     /// #    type Input = String;
     /// #    type Output = usize;
-    /// #    
+    /// #
     /// #    fn execute(&self, input: Self::Input) -> Result<Self::Output> {
     /// #       Ok(input.len())
     /// #    }
@@ -624,7 +626,7 @@ impl WorkerRuntime {
     /// }
     /// ```
     #[instrument(skip(self), level = "trace")]
-    pub async fn main_loop(&self) -> Result<()> {
+    pub async fn main_loop(&self, running: Option<Arc<AtomicBool>>) -> Result<()> {
         let mut task_stream = self.get_task_receiver().await?;
 
         const TERMINATION_CLEAR_INTERVAL: Duration = Duration::from_secs(60);
@@ -683,6 +685,13 @@ impl WorkerRuntime {
         }
 
         while let Some((payload, acker)) = task_stream.next().await {
+            if let Some(r) = &running {
+                if !r.load(Ordering::SeqCst) {
+                    warn!("worker gracefully shutting down due to CTRL-C signal (user shutdown)");
+                    break;
+                }
+            }
+
             // Skip tasks associated with terminated jobs.
             if terminated_jobs.contains_key(&payload.routing_key) {
                 trace!(routing_key = %payload.routing_key.simple(), "skipping terminated job");
